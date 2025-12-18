@@ -1,36 +1,35 @@
 import os
 import json
 import base64
-import uuid
-import secrets
 import string
+import secrets
 from getpass import getpass
-
-from argon2.low_level import hash_secret_raw, Type
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.backends import default_backend
 from rich import print
 
 VAULT_PATH = os.path.expanduser("~/.local_vault.json")
 
 # ------------------ Crypto ------------------
 
-def derive_key(password: str, salt: bytes) -> bytes:
-    return hash_secret_raw(
-        secret=password.encode(),
+def derive_key(password: str, salt: bytes, iterations: int = 100000) -> bytes:
+    """Derive a 256-bit key using PBKDF2-SHA256."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,  # 256-bit AES
         salt=salt,
-        time_cost=3,
-        memory_cost=65536,
-        parallelism=1,
-        hash_len=32,
-        type=Type.ID
+        iterations=iterations,
+        backend=default_backend()
     )
+    return kdf.derive(password.encode("utf-8"))
 
 def encrypt_vault(vault: dict, key: bytes) -> dict:
     aes = AESGCM(key)
-    nonce = os.urandom(12)
-    plaintext = json.dumps(vault).encode()
+    nonce = os.urandom(12)  # 12-byte nonce for AES-GCM
+    plaintext = json.dumps(vault).encode("utf-8")
     ciphertext = aes.encrypt(nonce, plaintext, None)
-
     return {
         "nonce": base64.b64encode(nonce).decode(),
         "ciphertext": base64.b64encode(ciphertext).decode()
@@ -64,10 +63,9 @@ def init_vault():
 
     data = {
         "kdf": {
-            "alg": "argon2id",
+            "alg": "pbkdf2-sha256",
             "salt": base64.b64encode(salt).decode(),
-            "mem": 65536,
-            "iters": 3
+            "iters": 100000
         },
         **encrypted
     }
@@ -88,7 +86,8 @@ def unlock_vault():
         data = json.load(f)
 
     salt = base64.b64decode(data["kdf"]["salt"])
-    key = derive_key(password, salt)
+    iterations = data["kdf"].get("iters", 100000)
+    key = derive_key(password, salt, iterations)
 
     try:
         vault = decrypt_vault(data, key)
@@ -119,6 +118,7 @@ def list_entries(vault):
         print(f"{e['id']} | {e['site']} | {e['username']}")
 
 def add_entry(vault):
+    import secrets, string
     site = input("Site: ")
     username = input("Username: ")
 
@@ -129,19 +129,8 @@ def add_entry(vault):
     else:
         password = getpass("Password: ")
 
-    # New:
-    if vault["entries"]:
-        new_id = max(e["id"] for e in vault["entries"]) + 1
-    else:
-        new_id = 1
-
-    entry = {
-        "id": new_id,
-        "site": site,
-        "username": username,
-        "password": password
-    }
-
+    new_id = max((e["id"] for e in vault["entries"]), default=0) + 1
+    entry = {"id": new_id, "site": site, "username": username, "password": password}
     vault["entries"].append(entry)
     print("[green]Entry added[/green]")
 
@@ -151,7 +140,6 @@ def get_entry(vault, entry_id):
     except ValueError:
         print("[red]Invalid ID[/red]")
         return
-
     for e in vault["entries"]:
         if e["id"] == entry_id:
             print(e)
